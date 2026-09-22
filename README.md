@@ -151,8 +151,9 @@ lock screen and, once unlocked, the dashboard itself - no server needed.
 
 ### Automation and deployment
 
-`.github/workflows/dashboard-data.yml` runs the whole thing daily
-(06:00 UTC, plus `workflow_dispatch` for a manual run), commits the
+`.github/workflows/dashboard-data.yml` runs the whole thing twice daily
+(08:00 and 15:00 Europe/Lisbon local time, plus `workflow_dispatch` for a
+manual run), commits the
 refreshed `dashboard/data/kpi-data.json` and the newly-locked
 `outputs/vercel/index.html` back to the repo, and stops there - it does
 **not** deploy directly. Instead, connect this repository to a Vercel
@@ -192,8 +193,11 @@ GitHub                                (webhook fires on push)
 Live on Vercel's CDN
 ```
 
-**HubSpot → GitHub** (`.github/workflows/dashboard-data.yml`, daily cron
-at 06:00 UTC plus `workflow_dispatch` for a manual run):
+**HubSpot → GitHub** (`.github/workflows/dashboard-data.yml`, cron twice
+daily at 08:00 and 15:00 Europe/Lisbon local time - GitHub Actions cron is
+UTC-only, so the schedule fires at both possible UTC offsets and a guard
+step discards whichever firing doesn't match the real Lisbon hour - plus
+`workflow_dispatch` for a manual run):
 
 1. Checkout, install dependencies.
 2. Run `generate_report.py` with the `HUBSPOT_ACCESS_TOKEN` secret - it

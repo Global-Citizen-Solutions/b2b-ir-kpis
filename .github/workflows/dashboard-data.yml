@@ -2,10 +2,13 @@ name: Refresh B2B IR KPI Dashboard
 
 on:
   schedule:
-    # 06:00 UTC, daily - ahead of weekly-report.yml's Monday run and early
-    # enough to be fresh before the workday in Europe/Lisbon. Independent of
-    # that workflow: this one never touches reports/reports.xlsx or email.
-    - cron: '0 6 * * *'
+    # Twice daily at 08:00 and 15:00 Europe/Lisbon local time, year-round
+    # across the WET/WEST DST switch. GitHub Actions cron is UTC-only, so
+    # this fires at both of Lisbon's possible UTC offsets (07:00 and 08:00
+    # UTC cover 08:00 Lisbon; 14:00 and 15:00 UTC cover 15:00 Lisbon) and
+    # the "Check Lisbon local time" step below discards whichever of the
+    # two daily firings doesn't match the real local hour.
+    - cron: '0 7,8,14,15 * * *'
   workflow_dispatch: {}
 
 permissions:
@@ -15,19 +18,37 @@ jobs:
   refresh-dashboard:
     runs-on: ubuntu-latest
     steps:
+      - name: Check Lisbon local time
+        id: lisbon_time
+        run: |
+          # Cron fires at both UTC offsets Lisbon can be at, so only one of
+          # today's two firings for a given target hour is the real one;
+          # every step below is skipped unless this matches 08:00/15:00
+          # Lisbon (a manual workflow_dispatch always proceeds regardless).
+          hour="$(TZ=Europe/Lisbon date +%H)"
+          if [ "$hour" = "08" ] || [ "$hour" = "15" ]; then
+            echo "on_time=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "on_time=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Checkout
+        if: github.event_name != 'schedule' || steps.lisbon_time.outputs.on_time == 'true'
         uses: actions/checkout@v4
 
       - name: Set up Python
+        if: github.event_name != 'schedule' || steps.lisbon_time.outputs.on_time == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: pip
 
       - name: Install dependencies
+        if: github.event_name != 'schedule' || steps.lisbon_time.outputs.on_time == 'true'
         run: pip install -r requirements.txt
 
       - name: Fetch KPI data from HubSpot
+        if: github.event_name != 'schedule' || steps.lisbon_time.outputs.on_time == 'true'
         env:
           HUBSPOT_ACCESS_TOKEN: ${{ secrets.HUBSPOT_ACCESS_TOKEN }}
         run: |
@@ -37,11 +58,13 @@ jobs:
           python generate_report.py
 
       - name: Build the dashboard
+        if: github.event_name != 'schedule' || steps.lisbon_time.outputs.on_time == 'true'
         run: |
           python3 dashboard/build_dashboard.py
           python3 dashboard/build_locked.py --password "${{ secrets.DASHBOARD_PASSWORD }}"
 
       - name: Commit updated dashboard data + build
+        if: github.event_name != 'schedule' || steps.lisbon_time.outputs.on_time == 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"

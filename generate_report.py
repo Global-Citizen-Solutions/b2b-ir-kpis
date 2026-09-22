@@ -644,8 +644,16 @@ def fetch_meetings(client: HubSpotClient, ref: ReferenceData) -> tuple[dict, dic
     by hs_activity_type: != "Presentation" (incl. unknown) -> Calls/Meetings,
     == "Presentation" -> Presentations. Grouped by deal owner + calendar day
     of the meeting's start time, scoped to this calendar year so far.
-    Deduped by (meeting_id, deal_owner_id) - a meeting attributed to both
-    BDMs produces one detail record per BDM, mirroring the count semantics.
+
+    A meeting's *primary* owner(s) come from the deal(s) it's linked to. If
+    the other known BDM also attended (in hs_attendee_owner_ids) or created
+    it (hs_created_by_user_id) but isn't a primary owner, the meeting also
+    counts for them - unless they already have a *different* meeting with
+    the same resolved company at the exact same start date+time, which
+    would mean they already have their own independent record of what's
+    really the same real-world session (skip to avoid double-counting it).
+    Deduped by (meeting_id, owner_id) - a meeting attributed to both BDMs
+    produces one detail record per BDM, mirroring the count semantics.
 
     Also returns per-meeting detail lists (id, owner, day, resolved
     "introducer contact" + their company - i.e. the meeting's own associated
@@ -686,10 +694,10 @@ def fetch_meetings(client: HubSpotClient, ref: ReferenceData) -> tuple[dict, dic
         ["hs_activity_type", "hs_meeting_start_time", "hs_attendee_owner_ids", "hs_created_by_user_id"],
     )
 
-    meetings_counts: dict = {}
-    presentations_counts: dict = {}
-    meetings_records: list = []
-    presentations_records: list = []
+    # Pass 1: qualify each meeting and collect what's needed to decide final
+    # attribution, without attributing yet (a cross-owner add needs to know
+    # about every meeting's company first - see pass 2 below).
+    qualifying: list = []
     skipped_no_start_time = []
     skipped_prior_year = 0
     skipped_future = 0
@@ -706,7 +714,8 @@ def fetch_meetings(client: HubSpotClient, ref: ReferenceData) -> tuple[dict, dic
         if not start_time:
             skipped_no_start_time.append(meeting_id)
             continue
-        day = parse_hubspot_datetime(start_time).date()
+        start_dt = parse_hubspot_datetime(start_time)
+        day = start_dt.date()
         if day < year_start_day:
             skipped_prior_year += 1
             continue
@@ -717,22 +726,67 @@ def fetch_meetings(client: HubSpotClient, ref: ReferenceData) -> tuple[dict, dic
             # through today).
             skipped_future += 1
             continue
-        is_presentation = props.get("hs_activity_type") == "Presentation"
 
-        for owner_id in meeting_owners.get(meeting_id, set()):
+        present_owners = attendee_owner_ids & known_owner_ids
+        if created_by_user_id in known_owner_ids:
+            present_owners = present_owners | {created_by_user_id}
+        qualifying.append({
+            "id": meeting_id,
+            "day": day,
+            "start_dt": start_dt,
+            "is_presentation": props.get("hs_activity_type") == "Presentation",
+            "primary_owners": meeting_owners.get(meeting_id, set()) & known_owner_ids,
+            "present_owners": present_owners,
+        })
+
+    # Resolve contact/company up front - needed both for the cross-owner
+    # duplicate check below (by company) and for the final records.
+    all_meeting_ids = [m["id"] for m in qualifying]
+    contact_company_by_meeting = _resolve_contact_and_company_for(client, "meetings", all_meeting_ids)
+    for m in qualifying:
+        company = (contact_company_by_meeting.get(m["id"]) or {}).get("company")
+        m["company_id"] = company["id"] if company else None
+
+    # Each owner's set of (company_id, start_dt) from meetings where they're
+    # already a primary (deal-owner) - what a cross-owner add is checked
+    # against, to avoid double-counting a session both BDMs already log
+    # independently.
+    owner_primary_index: dict = {owner_id: set() for owner_id in known_owner_ids}
+    for m in qualifying:
+        for owner_id in m["primary_owners"]:
+            owner_primary_index[owner_id].add((m["company_id"], m["start_dt"]))
+
+    meetings_counts: dict = {}
+    presentations_counts: dict = {}
+    meetings_records: list = []
+    presentations_records: list = []
+    cross_attributed = 0
+    cross_skipped_duplicate = 0
+    for m in qualifying:
+        final_owners = set(m["primary_owners"])
+        for owner_id in m["present_owners"] - m["primary_owners"]:
+            key = (m["company_id"], m["start_dt"])
+            already_has_it = m["company_id"] is not None and key in owner_primary_index[owner_id]
+            if already_has_it:
+                cross_skipped_duplicate += 1
+            else:
+                final_owners.add(owner_id)
+                cross_attributed += 1
+
+        for owner_id in final_owners:
             if owner_id not in known_owner_ids:
                 continue
-            bucket = presentations_counts if is_presentation else meetings_counts
-            bucket[(owner_id, day)] = bucket.get((owner_id, day), 0) + 1
-            records = presentations_records if is_presentation else meetings_records
-            records.append({"id": meeting_id, "owner": owner_id, "day": day.isoformat()})
-
-    all_meeting_ids = list({r["id"] for r in meetings_records + presentations_records})
-    contact_company_by_meeting = _resolve_contact_and_company_for(client, "meetings", all_meeting_ids)
-    for record in meetings_records + presentations_records:
-        extra = contact_company_by_meeting.get(record["id"], {"contact": None, "company": None})
-        record["contact"] = extra["contact"]
-        record["company"] = extra["company"]
+            bucket = presentations_counts if m["is_presentation"] else meetings_counts
+            bucket[(owner_id, m["day"])] = bucket.get((owner_id, m["day"]), 0) + 1
+            records = presentations_records if m["is_presentation"] else meetings_records
+            extra = contact_company_by_meeting.get(m["id"], {"contact": None, "company": None})
+            records.append({
+                "id": m["id"],
+                "owner": owner_id,
+                "day": m["day"].isoformat(),
+                "contact": extra["contact"],
+                "company": extra["company"],
+            })
 
     meetings_total = sum(meetings_counts.values())
     presentations_total = sum(presentations_counts.values())
@@ -748,6 +802,12 @@ def fetch_meetings(client: HubSpotClient, ref: ReferenceData) -> tuple[dict, dic
     if skipped_future:
         print(f"  {skipped_future} qualifying meeting(s) excluded - already booked but haven't happened yet "
               f"(start time after today)")
+    if cross_attributed:
+        print(f"  {cross_attributed} meeting(s) also attributed to the other BDM (attended, not deal-owner, "
+              f"no conflicting same-company/same-time meeting of their own)")
+    if cross_skipped_duplicate:
+        print(f"  {cross_skipped_duplicate} cross-attribution(s) skipped - other BDM already has a separate "
+              f"meeting with the same company at the same start time")
     return meetings_counts, presentations_counts, meetings_records, presentations_records
 
 
