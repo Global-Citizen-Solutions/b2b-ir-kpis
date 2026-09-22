@@ -224,17 +224,31 @@ function onNumLinkClick(btn) {
 /* One line per record, every field inline and joined by the same
    modal-row-sep divider - used by all three modal-builders below so the 5
    stages render structurally the same way, not just by convention. Each
-   segment is either {type:'link', href, label} (a real HubSpot record) or
+   segment is either {type:'link', href, label} (a real HubSpot record),
    {type:'text', label, missing?} (plain descriptive text - `missing: true`
-   renders it as the existing "No X on record" fallback style). */
+   renders it as the existing "No X on record" fallback style), or
+   {type:'pill', pillClass, label} (a small colored chip, e.g. the
+   Self-Sourced/Group-Sourced tag - see sourcedSegment()). */
 function renderModalRow(segments) {
   const parts = segments.map((seg, i) => {
     const html = seg.type === 'link'
       ? `<a href="${seg.href}" target="_blank" rel="noopener">${escapeHtml(seg.label)}</a>`
+      : seg.type === 'pill'
+      ? `<span class="pill ${seg.pillClass}">${escapeHtml(seg.label)}</span>`
       : `<span${seg.missing ? ' class="modal-item-missing"' : ''}>${escapeHtml(seg.label)}</span>`;
     return i === 0 ? html : `<span class="modal-row-sep" aria-hidden="true">·</span>${html}`;
   });
   return `<li class="modal-row">${parts.join('')}</li>`;
+}
+/* Self-Sourced/Group-Sourced tag for Retained/Referred/New Intermediaries
+   records (generate_report.py sets `sourced` to "self" or "group" for
+   those three stages only - Presentations/Calls-Meetings records never
+   have this key, so this returns null for them and the row is unaffected). */
+function sourcedSegment(sourced) {
+  if (!sourced) return null;
+  return sourced === 'group'
+    ? { type: 'pill', pillClass: 'pill-good', label: 'GROUP-SOURCED' }
+    : { type: 'pill', pillClass: 'pill-info', label: 'SELF-SOURCED' };
 }
 function companyOrMissing(company) {
   return company
@@ -300,7 +314,8 @@ function openRecordModal(records, title) {
     { type: 'link', href: `${D.meta.deal_url_base}${r.id}`, label: r.program || 'Program not specified' },
     referredBySegment(r.introducer_company),
     { type: 'text', label: `Signed ${fmtDate(r.day)}` },
-  ]);
+    sourcedSegment(r.sourced),
+  ].filter(Boolean));
   const subtitle = `${records.length} record${records.length === 1 ? '' : 's'} - click to open in HubSpot`;
   showModal(title, subtitle, records.map(itemHtml).join(''));
 }
@@ -314,7 +329,8 @@ function openReferredModal(records, title) {
     { type: 'link', href: `${D.meta.contact_url_base}${r.id}`, label: r.program || 'Program not specified' },
     referredBySegment(r.introducer_company),
     { type: 'text', label: fmtDate(r.day) },
-  ]);
+    sourcedSegment(r.sourced),
+  ].filter(Boolean));
   const subtitle = `${records.length} record${records.length === 1 ? '' : 's'} - click to open in HubSpot`;
   showModal(title, subtitle, records.map(itemHtml).join(''));
 }
@@ -327,7 +343,8 @@ function openCompanyContactModal(records, title) {
       ? { type: 'link', href: `${D.meta.contact_url_base}${r.contact.id}`, label: r.contact.name }
       : { type: 'text', label: 'No contact on record', missing: true },
     { type: 'text', label: fmtDate(r.day) },
-  ]);
+    sourcedSegment(r.sourced),
+  ].filter(Boolean));
   const subtitle = `${records.length} record${records.length === 1 ? '' : 's'} - click a company or contact to open it in HubSpot`;
   showModal(title, subtitle, records.map(itemHtml).join(''));
 }
