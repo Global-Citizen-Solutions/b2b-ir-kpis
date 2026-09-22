@@ -551,6 +551,24 @@ def _resolve_companies_for_contacts(client: HubSpotClient, contact_ids: list) ->
     return result
 
 
+def _resolve_lead_source_for_contacts(client: HubSpotClient, contact_ids: list, property_name: str) -> dict:
+    """{contact_id: raw_lead_source_value|None} via one batched contacts read.
+
+    Used to classify a record as Self-Sourced vs. Group-Sourced (the
+    latter when the value is "Internal Referral") - same `property_name`
+    fetch_referred_clients already reconciles at runtime for detecting
+    "Partner Referral" on a *different* contact (the referred person);
+    here it's read off the introducer/intermediary contact instead.
+    Returns the enumeration property's raw internal *value*, not its
+    display label - callers must resolve "Internal Referral" to that same
+    raw form via `_resolve_option_value` before comparing (see callers).
+    """
+    if not contact_ids:
+        return {}
+    props = client.batch_read("contacts", contact_ids, [property_name])
+    return {c["id"]: c["properties"].get(property_name) for c in props}
+
+
 def _resolve_contact_and_company_for(client: HubSpotClient, object_type: str, object_ids: list) -> dict:
     """{object_id: {"contact": {"id","name"}|None, "company": {"id","name"}|None}}
     for any object_type with a direct contacts association (deals for
@@ -811,15 +829,29 @@ def fetch_meetings(client: HubSpotClient, ref: ReferenceData) -> tuple[dict, dic
     return meetings_counts, presentations_counts, meetings_records, presentations_records
 
 
-def _partner_referral_value(client: HubSpotClient, property_name: str) -> str:
-    """Resolve the option *value* (not label) for 'Partner Referral' on the
-    given contact property."""
+def _resolve_option_value(client: HubSpotClient, property_name: str, label: str) -> str | None:
+    """Resolve a contact enumeration property option's internal *value*
+    for the given case-insensitive label - both filtering (search) and
+    reading (batch_read) enumeration properties deal in this raw value,
+    never the label shown in the HubSpot UI. Returns None if the property
+    has no option with this label (unlike _partner_referral_value, doesn't
+    raise - a label like "Internal Referral" may legitimately not exist
+    as an option on every candidate property)."""
     props = client.get("/crm/v3/properties/contacts").get("results", [])
     prop = next((p for p in props if p["name"] == property_name), None)
     for opt in (prop or {}).get("options", []):
-        if (opt.get("label") or "").strip().lower() == "partner referral":
+        if (opt.get("label") or "").strip().lower() == label.strip().lower():
             return opt["value"]
-    raise HubSpotError(f"Property '{property_name}' has no 'Partner Referral' option.")
+    return None
+
+
+def _partner_referral_value(client: HubSpotClient, property_name: str) -> str:
+    """Resolve the option *value* (not label) for 'Partner Referral' on the
+    given contact property."""
+    value = _resolve_option_value(client, property_name, "Partner Referral")
+    if value is None:
+        raise HubSpotError(f"Property '{property_name}' has no 'Partner Referral' option.")
+    return value
 
 
 def _partner_referral_contacts(client: HubSpotClient, property_name: str, extra_filters: list | None = None) -> list:
@@ -1021,9 +1053,23 @@ def fetch_referred_clients(client: HubSpotClient, ref: ReferenceData):
     programs = _resolve_contact_programs(client, ref, contact_ids)
     introducer_ids = list({c["_introducer_id"] for c in contacts})
     introducer_companies = _resolve_companies_for_contacts(client, introducer_ids)
+    # Self-Sourced vs. Group-Sourced for the dashboard's click-through
+    # modal: Group-Sourced when the introducer's own lead-source value
+    # (on this same reconciled property, just read off a different
+    # contact) is "Internal Referral"; Self-Sourced otherwise, including
+    # when it's blank/unknown - a plain binary, no third "unknown" state.
+    # Reads return the option's raw internal *value*, not its label (same
+    # reason _partner_referral_value exists), so the label has to be
+    # resolved to a value before comparing - a plain "Internal Referral"
+    # string comparison against the raw read would silently always be false.
+    internal_referral_value = _resolve_option_value(client, property_name, "Internal Referral")
+    introducer_lead_source = _resolve_lead_source_for_contacts(client, introducer_ids, property_name)
     for c in contacts:
         c["program"] = programs.get(c["id"])
-        c["introducer_company"] = introducer_companies.get(c.pop("_introducer_id"))
+        introducer_id = c.pop("_introducer_id")
+        c["introducer_company"] = introducer_companies.get(introducer_id)
+        is_group = internal_referral_value is not None and introducer_lead_source.get(introducer_id) == internal_referral_value
+        c["sourced"] = "group" if is_group else "self"
 
     return property_name, counts, contacts
 
@@ -1146,8 +1192,15 @@ def fetch_retained_clients(client: HubSpotClient, ref: ReferenceData, lead_sourc
 
     introducer_ids = list({d["_introducer_id"] for d in deals})
     introducer_companies = _resolve_companies_for_contacts(client, introducer_ids)
+    # Self-Sourced vs. Group-Sourced, same rule and same value-vs-label
+    # caveat as fetch_referred_clients.
+    internal_referral_value = _resolve_option_value(client, lead_source_property, "Internal Referral")
+    introducer_lead_source = _resolve_lead_source_for_contacts(client, introducer_ids, lead_source_property)
     for d in deals:
-        d["introducer_company"] = introducer_companies.get(d.pop("_introducer_id"))
+        introducer_id = d.pop("_introducer_id")
+        d["introducer_company"] = introducer_companies.get(introducer_id)
+        is_group = internal_referral_value is not None and introducer_lead_source.get(introducer_id) == internal_referral_value
+        d["sourced"] = "group" if is_group else "self"
 
     total = sum(counts.values())
     print(f"Retained Clients: {total} (year-to-date; all-time accepted ground truth was 6)")
@@ -1828,6 +1881,29 @@ def main() -> int:
     retained_clients, retained_program_breakdown, retained_deals = fetch_retained_clients(
         client, ref, lead_source_property
     )
+
+    # Self-Sourced vs. Group-Sourced for New Intermediaries: unlike
+    # Retained/Referred, this stage has no separately-resolved "introducer"
+    # contact (see fetch_new_intermediaries) - the closest equivalent is
+    # the record's own contact (the new intermediary being onboarded), so
+    # that contact's lead-source value is what's checked here. Deferred to
+    # this point (rather than done inside fetch_new_intermediaries itself)
+    # because lead_source_property isn't known until fetch_referred_clients
+    # has run, which happens after fetch_new_intermediaries above.
+    # Same value-vs-label caveat as fetch_referred_clients/fetch_retained_clients.
+    internal_referral_value = _resolve_option_value(client, lead_source_property, "Internal Referral")
+    new_intermediary_contact_ids = [r["contact"]["id"] for r in new_intermediary_records if r.get("contact")]
+    new_intermediary_lead_source = _resolve_lead_source_for_contacts(
+        client, new_intermediary_contact_ids, lead_source_property
+    )
+    for r in new_intermediary_records:
+        contact_id = r["contact"]["id"] if r.get("contact") else None
+        is_group = (
+            internal_referral_value is not None
+            and contact_id is not None
+            and new_intermediary_lead_source.get(contact_id) == internal_referral_value
+        )
+        r["sourced"] = "group" if is_group else "self"
 
     # Order matches STAGE_LABELS: Retained -> Referred -> New Intermediaries
     # -> Presentations -> Calls/Meetings. (The dashboard uses its own,
