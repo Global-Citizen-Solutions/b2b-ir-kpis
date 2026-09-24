@@ -5,9 +5,12 @@ on:
     # Twice daily at 08:00 and 15:00 Europe/Lisbon local time, year-round
     # across the WET/WEST DST switch. GitHub Actions cron is UTC-only, so
     # this fires at both of Lisbon's possible UTC offsets (07:00 and 08:00
-    # UTC cover 08:00 Lisbon; 14:00 and 15:00 UTC cover 15:00 Lisbon) and
-    # the "Check Lisbon local time" step below discards whichever of the
-    # two daily firings doesn't match the real local hour.
+    # UTC cover 08:00 Lisbon; 14:00 and 15:00 UTC cover 15:00 Lisbon). The
+    # "Check Lisbon local time" step below accepts whichever of the two
+    # daily firings lands in the right half of the day - GitHub routinely
+    # delays scheduled runs by hours (all 4 firings here land on :00, a
+    # congested queueing time), so an exact-hour match discarded nearly
+    # every real firing and the dashboard never auto-refreshed.
     - cron: '0 7,8,14,15 * * *'
   workflow_dispatch: {}
 
@@ -22,11 +25,17 @@ jobs:
         id: lisbon_time
         run: |
           # Cron fires at both UTC offsets Lisbon can be at, so only one of
-          # today's two firings for a given target hour is the real one;
-          # every step below is skipped unless this matches 08:00/15:00
-          # Lisbon (a manual workflow_dispatch always proceeds regardless).
+          # today's two firings for a given target hour is the real one.
+          # GitHub Actions delays scheduled runs (observed up to ~5h on this
+          # repo), so an exact 08/15 hour match discarded nearly every real
+          # firing. Accept any hour in the correct half of the day instead -
+          # wide enough to absorb realistic delay, still split at midday so
+          # the morning/afternoon UTC-offset firings can't double-count (a
+          # manual workflow_dispatch always proceeds regardless).
           hour="$(TZ=Europe/Lisbon date +%H)"
-          if [ "$hour" = "08" ] || [ "$hour" = "15" ]; then
+          if [ "$hour" -ge 6 ] && [ "$hour" -lt 12 ]; then
+            echo "on_time=true" >> "$GITHUB_OUTPUT"
+          elif [ "$hour" -ge 12 ] && [ "$hour" -lt 22 ]; then
             echo "on_time=true" >> "$GITHUB_OUTPUT"
           else
             echo "on_time=false" >> "$GITHUB_OUTPUT"
