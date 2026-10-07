@@ -1,0 +1,6 @@
+# Allow-list: the image only needs the freshly built page and the nginx
+# config. Keeps .env, dashboard/data/*.json and the Python sources out of the
+# build context.
+**
+!nginx.conf
+!outputs/index.html
