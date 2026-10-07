@@ -1,6 +1,27 @@
 name: Refresh B2B IR KPI Dashboard
 
+# Refreshes the data from HubSpot, builds the dashboard page, bakes it into a
+# small nginx image and deploys that to the shared Azure Container Apps
+# environment via gcs-azure-infrastructure's reusable workflow (Entra ID
+# sign-in in front). Nothing is committed back to the repo: the page holds
+# real client/intermediary names, so it only ever lives in this run's
+# workspace and in the image. See that repo's docs/onboarding-a-new-app.md
+# for the one-time setup (federated credential + role assignment, the Entra
+# sign-in App Registration, repo variables/secrets) - none of it lives here.
+
 on:
+  # Also redeploys when the code behind the page changes. Scheduled runs only
+  # ever run from the repository's default branch, so main must be the
+  # default branch (see README, "Deployment").
+  push:
+    branches: [main]
+    paths:
+      - dashboard/**
+      - generate_report.py
+      - requirements.txt
+      - Dockerfile
+      - nginx.conf
+      - .github/workflows/dashboard-data.yml
   schedule:
     # Twice daily at 08:00 and 15:00 Europe/Lisbon local time, year-round
     # across the WET/WEST DST switch. GitHub Actions cron is UTC-only, so
@@ -14,12 +35,25 @@ on:
     - cron: '0 7,8,14,15 * * *'
   workflow_dispatch: {}
 
-permissions:
-  contents: write
+# One refresh/deploy at a time. Two runs close together would both try to
+# update the Container App and Azure rejects the second with
+# "ContainerAppOperationInProgress". Runs queue instead (the newest waiting
+# run replaces older waiting ones, which is fine because it carries fresher
+# data), and a deploy that is already running is never cancelled halfway.
+concurrency:
+  group: deploy-b2b-ir-kpis
+  cancel-in-progress: false
 
 jobs:
   refresh-dashboard:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      # Empty when a scheduled firing was skipped by the Lisbon guard, which
+      # also skips the deploy job below.
+      image: ${{ steps.image.outputs.image }}
     steps:
       - name: Check Lisbon local time
         id: lisbon_time
@@ -69,18 +103,67 @@ jobs:
       - name: Build the dashboard
         if: github.event_name != 'schedule' || steps.lisbon_time.outputs.on_time == 'true'
         run: |
+          # Writes the plaintext outputs/index.html (gitignored, never
+          # committed). build_locked.py, the old client-side password lock,
+          # is no longer part of the pipeline: Entra sign-in replaces it.
           python3 dashboard/build_dashboard.py
-          python3 dashboard/build_locked.py --password "${{ secrets.DASHBOARD_PASSWORD }}"
 
-      - name: Commit updated dashboard data + build
+      - name: Log in to GHCR
         if: github.event_name != 'schedule' || steps.lisbon_time.outputs.on_time == 'true'
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add dashboard/data/kpi-data.json
-          # outputs/ is gitignored (a throwaway local build folder that would
-          # otherwise carry a locally-typed test password) - force-add just
-          # the one file Vercel serves, built here with the real secret.
-          git add -f outputs/vercel/index.html
-          git diff --staged --quiet || git commit -m "Refresh B2B IR KPI dashboard [skip ci]"
-          git push
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set image tag
+        id: image
+        if: github.event_name != 'schedule' || steps.lisbon_time.outputs.on_time == 'true'
+        # run_id as well as the sha: scheduled refreshes re-use the same
+        # commit with fresh data, and every deploy needs a new image tag.
+        run: echo "image=ghcr.io/global-citizen-solutions/b2b-ir-kpis:${{ github.sha }}-${{ github.run_id }}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push the image
+        if: github.event_name != 'schedule' || steps.lisbon_time.outputs.on_time == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.image.outputs.image }}
+
+  deploy:
+    needs: refresh-dashboard
+    if: needs.refresh-dashboard.outputs.image != ''
+    # id-token: write is required here, not just inside the reusable
+    # workflow - a reusable-workflow call's token is capped at the
+    # intersection of what the caller job grants and what the callee
+    # requests, so without this the callee's own `permissions: id-token:
+    # write` (for its azure/login OIDC step) is silently reduced to none
+    # and the deploy fails at Azure login on every run.
+    permissions:
+      id-token: write
+      contents: read
+    uses: Global-Citizen-Solutions/gcs-azure-infrastructure/.github/workflows/deploy-container-app.yml@main
+    with:
+      app_name: b2b-ir-kpis
+      image: ${{ needs.refresh-dashboard.outputs.image }}
+      target_port: 8080
+      cpu: "0.25"
+      memory: "0.5Gi"
+      min_replicas: 1
+      max_replicas: 2
+      # Company sign-in in front of the page (Container Apps Built-in
+      # Authentication). The page is plaintext, so this is its only lock: the
+      # Entra app must have "assignment required" with a user group before
+      # the URL is shared. The App Registration comes from the infra repo's
+      # scripts/create-entra-auth-app.sh, which sets ENTRA_CLIENT_ID and
+      # ENTRA_CLIENT_SECRET on this repo.
+      entra_auth_enabled: true
+      entra_client_id: ${{ vars.ENTRA_CLIENT_ID }}
+    secrets:
+      azure_client_id: ${{ vars.AZURE_CLIENT_ID }}
+      azure_tenant_id: ${{ vars.AZURE_TENANT_ID }}
+      azure_subscription_id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      registry_username: ${{ github.actor }}
+      registry_password: ${{ secrets.GHCR_PULL_TOKEN }}
+      entra_client_secret: ${{ secrets.ENTRA_CLIENT_SECRET }}

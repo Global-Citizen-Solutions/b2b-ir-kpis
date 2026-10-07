@@ -7,13 +7,15 @@ __pycache__/
 .venv/
 venv/
 
-# Dashboard build output. Locally this is just a throwaway build folder
-# (rebuild any time with dashboard/build_dashboard.py + build_locked.py) -
-# nothing here should be committed with a locally-typed test password.
-# The daily dashboard-data.yml workflow force-adds outputs/vercel/index.html
-# specifically (git add -f) when it commits the real, secret-locked build -
-# same reasoning as reports/reports.xlsx being tracked, since pushing it is
-# what triggers Vercel's Git-integration deploy.
+# The generated dataset holds real client/intermediary names and HubSpot
+# links, so it is never committed: dashboard-data.yml regenerates it in CI and
+# bakes the page into the Azure image. Rebuild locally with generate_report.py.
+dashboard/data/*.json
+
+# Dashboard build output - a throwaway folder (rebuild any time with
+# dashboard/build_dashboard.py). outputs/index.html is the plaintext page.
+# outputs/vercel/index.html is the old password-locked build, left in place
+# only until the Vercel project is retired; nothing updates it any more.
 outputs/
 dashboard/.vercel/
 

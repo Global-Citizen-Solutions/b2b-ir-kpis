@@ -6,8 +6,8 @@ Calls/Meetings, New Intermediaries) for the Institutional Relations BDMs
 (João Pacheco Gonçalves and Rohan Harris).
 
 The primary output today is the **[web dashboard](#web-dashboard)**
-(`dashboard/data/kpi-data.json`, refreshed daily via GitHub Actions and
-published on Vercel). An Excel-workbook output also exists in this file
+(`dashboard/data/kpi-data.json`, refreshed twice daily via GitHub Actions and
+published on Azure Container Apps). An Excel-workbook output also exists in this file
 (`build_workbook()` and its styling helpers) but is currently **dormant**
 - not run automatically, not wired into `main()` - kept in case it's
 needed again later; see [Excel workbook (dormant)](#excel-workbook-dormant)
@@ -125,124 +125,96 @@ and a static KPI Targets reference tab.
 ## Web dashboard
 
 `generate_report.py` writes `dashboard/data/kpi-data.json` - the computed
-numbers, reshaped for a live web dashboard published on Vercel. This is
-the primary output today (the Excel workbook above is dormant).
+numbers, reshaped for a live web dashboard published on Azure Container
+Apps. This is the primary output today (the Excel workbook above is
+dormant).
 
 The dashboard follows the same pattern as the sibling
 `gcs-hubspot-funnel-reporting` project: no framework, no server. A small
 Python build step inlines the JSON dataset and the GCS logos into three
 HTML templates (`dashboard/template_head.html`, `template_body.html`,
-`template_js.html`), producing one self-contained `outputs/index.html`.
-A second step wraps that file in a client-side, AES-256-GCM password lock
-screen (`outputs/vercel/index.html`) - the actual access control, since
-Vercel's own deployment protection doesn't cover a bare `*.vercel.app`
-alias.
+`template_js.html`), producing one self-contained, plaintext
+`outputs/index.html`. Access control is company Microsoft (Entra ID)
+sign-in in front of the app; the page itself is no longer encrypted, so
+it, and the dataset behind it, are never committed (see below).
 
 ### Building it locally
 
 ```bash
 python generate_report.py                                    # writes dashboard/data/kpi-data.json
 python3 dashboard/build_dashboard.py                          # -> outputs/index.html
-python3 dashboard/build_locked.py --password 'your-password'  # -> outputs/vercel/index.html
 ```
 
-Open `outputs/vercel/index.html` directly in a browser to preview the
-lock screen and, once unlocked, the dashboard itself - no server needed.
+Open `outputs/index.html` directly in a browser to preview the dashboard -
+no server needed. (`dashboard/build_locked.py`, the old client-side password
+lock, is kept but no longer part of the pipeline.)
 
-### Automation and deployment
+### Automation and deployment (Azure)
 
-`.github/workflows/dashboard-data.yml` runs the whole thing twice daily
-(08:00 and 15:00 Europe/Lisbon local time, plus `workflow_dispatch` for a
-manual run), commits the
-refreshed `dashboard/data/kpi-data.json` and the newly-locked
-`outputs/vercel/index.html` back to the repo, and stops there - it does
-**not** deploy directly. Instead, connect this repository to a Vercel
-project once (Vercel dashboard → Add New Project → import this repo,
-framework preset "Other", no build command, output directory
-`outputs/vercel`): Vercel's native Git integration then deploys
-automatically on every push to `main`, since the push itself is what
-lands a new `outputs/vercel/index.html` in the repo.
-
-Required repository secret in addition to the ones above:
-
-| Secret | Purpose |
-|---|---|
-| `DASHBOARD_PASSWORD` | The password the lock screen decrypts with - share this with whoever needs dashboard access, rotate by changing the secret (next daily run re-locks with it) |
-
-### How it works: HubSpot → GitHub → Vercel
-
-The end-to-end pipeline, for reference or for replicating this same
-pattern in another project:
+`.github/workflows/dashboard-data.yml` runs twice daily (08:00 and 15:00
+Europe/Lisbon local time), on `workflow_dispatch`, and on pushes to `main`
+that touch the code behind the page. Each run: fetches from HubSpot
+(`generate_report.py`, `HUBSPOT_ACCESS_TOKEN`), builds the plaintext
+`outputs/index.html`, bakes it into a small nginx image (`Dockerfile`),
+pushes that to GHCR (`ghcr.io/global-citizen-solutions/b2b-ir-kpis`) and
+calls
+[`gcs-azure-infrastructure`](https://github.com/Global-Citizen-Solutions/gcs-azure-infrastructure)'s
+reusable `deploy-container-app.yml` with Entra ID sign-in on. **Nothing is
+committed back**: the page and `dashboard/data/kpi-data.json` hold real
+client and intermediary names, so they only live in the run's workspace and
+in the image (both are gitignored).
 
 ```
 HubSpot API
     │  generate_report.py (HUBSPOT_ACCESS_TOKEN secret)
     ▼
-dashboard/data/kpi-data.json         ← the one handoff point
+dashboard/data/kpi-data.json         (gitignored, CI workspace only)
     │  dashboard/build_dashboard.py
     ▼
-outputs/index.html                   (gitignored, plaintext, local-only)
-    │  dashboard/build_locked.py (DASHBOARD_PASSWORD secret)
+outputs/index.html                   (gitignored, plaintext)
+    │  Dockerfile (nginx) -> ghcr.io/global-citizen-solutions/b2b-ir-kpis
     ▼
-outputs/vercel/index.html            ← force-added, the only file served
-    │  git commit + push to main
-    ▼
-GitHub                                (webhook fires on push)
-    │  Vercel's native Git integration, no build
-    ▼
-Live on Vercel's CDN
+Azure Container App 'b2b-ir-kpis' in cae-prod, behind Entra ID sign-in
 ```
 
-**HubSpot → GitHub** (`.github/workflows/dashboard-data.yml`, cron twice
-daily at 08:00 and 15:00 Europe/Lisbon local time - GitHub Actions cron is
-UTC-only, so the schedule fires at both possible UTC offsets and a guard
-step discards whichever firing doesn't match the real Lisbon hour - plus
-`workflow_dispatch` for a manual run):
+Same guard as before: the cron fires at both possible UTC offsets and a
+tolerant Lisbon-hour check skips a scheduled firing that is outside the
+06:00-21:59 window (a manual run always proceeds); a skipped firing also
+skips the deploy.
 
-1. Checkout, install dependencies.
-2. Run `generate_report.py` with the `HUBSPOT_ACCESS_TOKEN` secret - it
-   fetches from HubSpot and writes `dashboard/data/kpi-data.json`. This
-   JSON file is the **only** handoff point between "fetch the data" and
-   "build the page" - nothing downstream talks to HubSpot directly.
-3. Run `dashboard/build_dashboard.py`, then `dashboard/build_locked.py
-   --password "$DASHBOARD_PASSWORD"` - together these inline the JSON
-   and the GCS logos into one self-contained, password-locked
-   `outputs/vercel/index.html`.
-4. Commit `dashboard/data/kpi-data.json` and `outputs/vercel/index.html`
-   back to `main`. `outputs/` is gitignored (so local test builds don't
-   pollute the repo), but this step force-adds
-   (`git add -f outputs/vercel/index.html`) that one file specifically -
-   it has to be tracked, since landing it in a commit is what triggers
-   the next stage.
+**Scheduled runs only run from the repository's default branch**, and the
+push trigger watches `main`, so `main` must be the GitHub default branch
+(until the move it was `claude/b2b-ir-kpi-report-generator-3e46eq`).
 
-**GitHub → Vercel**: no deploy script, no `VERCEL_TOKEN`, no API call at
-all - this relies entirely on **Vercel's native Git integration**,
-configured once, by hand, in the Vercel dashboard (Project Settings):
+**Who can open it**: the Entra app registration `easyauth-b2b-ir-kpis` must
+have "assignment required" with a user group (the tenant convention is
+`eid_<app>_users`) before the URL is shared. The page is plaintext, so that
+is its only lock.
 
-| Setting | Value |
-|---|---|
-| Framework Preset | Other |
-| Build Command | *(empty)* |
-| Install Command | *(empty)* |
-| Output Directory | `outputs/vercel`, **override toggle switched on** |
+#### One-time setup (not triggered by pushing code)
 
-The override toggle is the part most likely to get missed - a typed
-Output Directory value is silently ignored if that toggle isn't
-explicitly enabled, and Vercel falls back to serving the repo root
-instead (this produced a real 404 the first time this project was set
-up). With it configured correctly, every push to `main` makes Vercel's
-GitHub webhook fire, it deploys near-instantly (there's nothing to
-build, just static files to serve), and the new content is live on
-Vercel's CDN - typically within a few seconds of the workflow's commit
-landing.
+Lives outside this repo, see `gcs-azure-infrastructure`'s
+`docs/getting-started.md`:
+
+- `./scripts/onboard-app-repo.sh b2b-ir-kpis --dedicated-identity`
+- GitHub Environment `production` (deployments from `main` only), variables
+  `AZURE_CLIENT_ID` / `AZURE_TENANT_ID` / `AZURE_SUBSCRIPTION_ID`, secret
+  `GHCR_PULL_TOKEN` (classic PAT, `read:packages`).
+- `./scripts/create-entra-auth-app.sh b2b-ir-kpis --github-repo b2b-ir-kpis`
+  (sets `ENTRA_CLIENT_ID` / `ENTRA_CLIENT_SECRET`); run it once more after the
+  first deploy to register the app's callback URL.
+- Repository secret `HUBSPOT_ACCESS_TOKEN` (already there). `DASHBOARD_PASSWORD`
+  is no longer used and can be deleted.
+
+If a run fails at Azure login, image pull or the sign-in check, suspect that
+setup before the workflow.
 
 **Adapting this for another project**: the reusable idea is the
-JSON-in-the-middle handoff - decoupling "fetch your data" from "build
-the page" means either half can change independently, and the page-build
-step never needs credentials for whatever you're fetching from. The
-password-lock step (`build_locked.py`) is optional - skip it entirely if
-the other project's data isn't sensitive, or rely on Vercel's own
-deployment protection instead if the plan supports it.
+JSON-in-the-middle handoff - decoupling "fetch your data" from "build the
+page" means either half can change independently, and the page-build step
+never needs credentials for whatever you're fetching from. For data that is
+not public, keep the page and dataset out of git and put real sign-in in
+front of it, as here.
 
 ### What's on the dashboard
 
